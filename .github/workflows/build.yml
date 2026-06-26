@@ -1,107 +1,301 @@
-name: Build RakNetDLL
+name: Build RakNetDLL shared libraries
 
 on:
   push:
     tags:
       - 'v*'
-
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (e.g. v1.0.0)"
+        description: 'Release tag to create/use, for example v1.0.0'
         required: true
+        type: string
+
+permissions:
+  contents: write
 
 env:
   DIST: dist
+  ANDROID_API: '23'
+  NDK_VERSION: '27.2.12479018'
 
 jobs:
-
-  build-linux-x64:
+  build-so:
+    name: Build ${{ matrix.target }}
     runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            cxx: g++
+            install: ''
+            cxxflags: '-fPIC -fvisibility=default'
+            ldflags: '-pthread'
+            experimental: false
+
+          - target: linux-x86
+            cxx: g++
+            install: 'g++-multilib libc6-dev-i386'
+            cxxflags: '-m32 -fPIC -fvisibility=default'
+            ldflags: '-m32 -pthread'
+            experimental: false
+
+          - target: linux-arm64
+            cxx: aarch64-linux-gnu-g++
+            install: 'g++-aarch64-linux-gnu'
+            cxxflags: '-fPIC -fvisibility=default'
+            ldflags: '-pthread'
+            experimental: false
+
+          # Android is marked experimental because old RakNet code can expose
+          # platform-specific compile issues depending on the NDK version.
+          - target: android-arm64
+            cxx: android-ndk
+            install: ''
+            cxxflags: '-fPIC -fvisibility=default -DANDROID'
+            ldflags: ''
+            experimental: true
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Build Linux Shared Library
+      - name: Install Linux cross compiler dependencies
+        if: matrix.install != ''
         run: |
-          chmod +x build_dll.sh
-          ./build_dll.sh linux64
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.install }}
 
-      - name: Upload Linux artifact
+      - name: Install Android NDK
+        if: matrix.target == 'android-arm64'
+        run: |
+          set -euo pipefail
+
+          if [ -z "${ANDROID_HOME:-}" ]; then
+            echo "ANDROID_HOME is not set on this runner."
+            echo "ubuntu-latest normally includes the Android SDK; try ubuntu-22.04 if this fails."
+            exit 1
+          fi
+
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER="$(command -v sdkmanager || true)"
+          fi
+          if [ -z "$SDKMANAGER" ] || [ ! -x "$SDKMANAGER" ]; then
+            echo "sdkmanager not found on this runner."
+            exit 1
+          fi
+
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          yes | "$SDKMANAGER" --install "ndk;${NDK_VERSION}"
+
+          NDK_PATH="$ANDROID_HOME/ndk/${NDK_VERSION}"
+          CXX_PATH="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android${ANDROID_API}-clang++"
+
+          if [ ! -x "$CXX_PATH" ]; then
+            echo "Android compiler not found: $CXX_PATH"
+            exit 1
+          fi
+
+          echo "ANDROID_NDK_HOME=$NDK_PATH" >> "$GITHUB_ENV"
+          echo "REAL_CXX=$CXX_PATH" >> "$GITHUB_ENV"
+
+      - name: Select compiler
+        if: matrix.target != 'android-arm64'
+        run: |
+          echo "REAL_CXX=${{ matrix.cxx }}" >> "$GITHUB_ENV"
+
+      - name: Build shared library
+        env:
+          TARGET: ${{ matrix.target }}
+          CXXFLAGS_EXTRA: ${{ matrix.cxxflags }}
+          LDFLAGS_EXTRA: ${{ matrix.ldflags }}
+        run: |
+          set -euo pipefail
+
+          SRC_DIR="$GITHUB_WORKSPACE/Source"
+          OUT_DIR="$GITHUB_WORKSPACE/${DIST}/${TARGET}"
+          OBJ_DIR="$OUT_DIR/obj"
+          mkdir -p "$OBJ_DIR"
+
+          if [ ! -d "$SRC_DIR" ]; then
+            echo "Missing Source directory. Are you running this at the repo root?"
+            exit 1
+          fi
+
+          mapfile -t SOURCES < <(
+            find "$SRC_DIR" -maxdepth 1 -name '*.cpp' \
+              ! -name '*_PS3*' \
+              ! -name '*_PS4*' \
+              ! -name '*_Vita*' \
+              ! -name '*_360*' \
+              ! -name '*_720*' \
+              ! -name '*WindowsStore*' \
+              ! -name '*NativeClient*' \
+              | sort
+          )
+
+          echo "Compiler: $REAL_CXX"
+          "$REAL_CXX" --version || true
+          echo "Target:   $TARGET"
+          echo "Sources:  ${#SOURCES[@]}"
+
+          COMMON_DEFS="-D_RAKNET_DLL -DRAKNET_C_EXPORTS"
+          COMMON_OPTS="-std=c++14 -O2 -w"
+
+          if [ "$TARGET" = "android-arm64" ]; then
+            COMMON_DEFS="$COMMON_DEFS -DANDROID -D__ANDROID_API__=${ANDROID_API}"
+          fi
+
+          JOBS="$(getconf _NPROCESSORS_ONLN || echo 2)"
+          FAIL=0
+
+          for SRC_FILE in "${SOURCES[@]}"; do
+            BASE="$(basename "$SRC_FILE" .cpp)"
+            OBJ_FILE="$OBJ_DIR/$BASE.o"
+
+            "$REAL_CXX" -c $COMMON_OPTS $COMMON_DEFS $CXXFLAGS_EXTRA \
+              -I"$SRC_DIR" \
+              "$SRC_FILE" \
+              -o "$OBJ_FILE" &
+
+            while [ "$(jobs -pr | wc -l)" -ge "$JOBS" ]; do
+              if ! wait -n; then
+                FAIL=1
+              fi
+            done
+          done
+
+          while [ "$(jobs -pr | wc -l)" -gt 0 ]; do
+            if ! wait -n; then
+              FAIL=1
+            fi
+          done
+
+          if [ "$FAIL" -ne 0 ]; then
+            echo "One or more compile jobs failed."
+            exit 1
+          fi
+
+          OUT_SO="$OUT_DIR/libRakNetDLL-${TARGET}.so"
+
+          "$REAL_CXX" -shared $CXXFLAGS_EXTRA \
+            -o "$OUT_SO" \
+            "$OBJ_DIR"/*.o \
+            $LDFLAGS_EXTRA
+
+          cp "$SRC_DIR/raknet_c.h" "$OUT_DIR/raknet_c.h"
+          rm -rf "$OBJ_DIR"
+
+          echo "Built files:"
+          ls -lh "$OUT_DIR"
+          file "$OUT_SO" || true
+
+      - name: Upload ${{ matrix.target }} artifact
         uses: actions/upload-artifact@v4
         with:
-          name: linux-x64
-          path: dist/linux-x64/libRakNetDLL.so
-
-
-  build-windows:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install LLVM-MinGW
-        run: |
-          RELEASE=$(curl -fsSL https://api.github.com/repos/mstorsjo/llvm-mingw/releases/latest \
-            | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])")
-
-          TARBALL="llvm-mingw-${RELEASE}-ucrt-ubuntu-22.04-x86_64.tar.xz"
-          URL="https://github.com/mstorsjo/llvm-mingw/releases/download/${RELEASE}/${TARBALL}"
-
-          curl -fsSL -o /tmp/llvm-mingw.tar.xz "$URL"
-          sudo tar -xf /tmp/llvm-mingw.tar.xz -C /opt
-          echo "/opt/llvm-mingw-${RELEASE}-ucrt-ubuntu-22.04-x86_64/bin" >> "$GITHUB_PATH"
-
-      - name: Build DLLs
-        run: |
-          chmod +x build_dll.sh
-          ./build_dll.sh win64
-          ./build_dll.sh win32
-          ./build_dll.sh win-arm64
-
-      - name: Upload Windows artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-builds
+          name: ${{ matrix.target }}
+          if-no-files-found: error
           path: |
-            dist/win-x64/RakNetDLL.dll
-            dist/win-x32/RakNetDLL.dll
-            dist/win-arm64/RakNetDLL.dll
-
+            ${{ env.DIST }}/${{ matrix.target }}/*.so
+            ${{ env.DIST }}/${{ matrix.target }}/raknet_c.h
 
   release:
-    needs: [build-linux-x64, build-windows]
+    name: Create GitHub Release
+    needs: build-so
     runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     permissions:
       contents: write
 
-    # فقط وقتی tag داریم اجرا شود
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
-
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: Prepare files
+      - name: Prepare release files
         run: |
-          mv artifacts/linux-x64/libRakNetDLL.so artifacts/raknet-linux-x64.so
-          mv artifacts/windows-builds/RakNetDLL.dll artifacts/raknet.dll
+          set -euo pipefail
+          mkdir -p release
 
-      - name: Set tag variable
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "TAG=${{ inputs.tag }}" >> $GITHUB_ENV
+          echo "Downloaded artifact tree:"
+          find artifacts -type f -print | sort
+
+          find artifacts -type f -name '*.so' -exec cp -v '{}' release/ \;
+
+          if [ -f Source/raknet_c.h ]; then
+            cp -v Source/raknet_c.h release/raknet_c.h
           else
-            echo "TAG=${GITHUB_REF_NAME}" >> $GITHUB_ENV
+            HEADER="$(find artifacts -type f -name 'raknet_c.h' | head -n 1 || true)"
+            if [ -n "$HEADER" ]; then
+              cp -v "$HEADER" release/raknet_c.h
+            fi
           fi
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ env.TAG }}
-          name: "RakNetDLL ${{ env.TAG }}"
-          files: |
-            artifacts/raknet-linux-x64.so
-            artifacts/raknet.dll
+          if ! find release -type f -name '*.so' | grep -q .; then
+            echo "No .so files were built, refusing to create an empty release."
+            exit 1
+          fi
+
+          (cd release && sha256sum * > SHA256SUMS.txt)
+
+          echo "Release files:"
+          ls -lh release
+
+      - name: Resolve release tag
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+
+          if [ -z "$TAG" ]; then
+            echo "Release tag is empty."
+            exit 1
+          fi
+
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+
+      - name: Ensure tag exists
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --tags --force
+
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "Tag ${TAG} already exists."
+          else
+            echo "Creating tag ${TAG} at ${GITHUB_SHA}"
+            git tag "${TAG}" "${GITHUB_SHA}"
+            git push origin "refs/tags/${TAG}"
+          fi
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          NOTES="RakNetDLL shared library builds.\n\nFiles included when successfully built:\n- libRakNetDLL-linux-x64.so\n- libRakNetDLL-linux-x86.so\n- libRakNetDLL-linux-arm64.so\n- libRakNetDLL-android-arm64.so\n- raknet_c.h\n- SHA256SUMS.txt"
+
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists; uploading/replacing assets."
+            gh release upload "${TAG}" release/* --clobber
+          else
+            gh release create "${TAG}" release/* \
+              --title "RakNetDLL ${TAG}" \
+              --notes "$NOTES" \
+              --verify-tag
+          fi
