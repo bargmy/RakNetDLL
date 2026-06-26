@@ -6,6 +6,9 @@ on:
       - 'v*'         # trigger on version tags like v1.0.0
   workflow_dispatch: # also allow manual trigger from GitHub UI
 
+env:
+  DIST: dist
+
 jobs:
   # ── Linux x64 ────────────────────────────────────────────────────────────
   build-linux-x64:

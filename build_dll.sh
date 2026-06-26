@@ -18,7 +18,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="$SCRIPT_DIR/Source"
-DIST="$SCRIPT_DIR/../dist"
+DIST="${DIST:-$SCRIPT_DIR/../dist}"
 
 # Gather .cpp sources — skip platform stubs irrelevant to our targets
 mapfile -t SOURCES < <(find "$SRC" -maxdepth 1 -name "*.cpp" \
