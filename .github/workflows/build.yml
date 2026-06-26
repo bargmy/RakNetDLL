@@ -270,10 +270,39 @@ jobs:
           NAME="$(sed -n '2p' /tmp/llvm-mingw-asset.txt)"
 
           echo "Downloading $NAME"
-          curl -fsSL -o /tmp/llvm-mingw.tar.xz "$URL"
+          curl --fail --location --show-error --silent --retry 5 --retry-delay 2 \
+            -o /tmp/llvm-mingw.tar.xz "$URL"
 
-          ROOT_DIR="$(tar -tf /tmp/llvm-mingw.tar.xz | head -n 1 | cut -d/ -f1)"
+          # Do not use: tar -tf file | head -n 1
+          # With `set -o pipefail`, head closes the pipe early and tar exits with:
+          #   tar: stdout: write error
+          # Read the root directory with Python instead, with no pipe.
+          ROOT_DIR="$(python3 - <<'PYROOT'
+          import tarfile
+          archive = '/tmp/llvm-mingw.tar.xz'
+          with tarfile.open(archive, 'r:xz') as tf:
+              for member in tf:
+                  name = member.name.split('/', 1)[0]
+                  if name:
+                      print(name)
+                      break
+          PYROOT
+          )"
+
+          if [ -z "$ROOT_DIR" ]; then
+            echo "Could not detect LLVM-MinGW root directory inside archive."
+            exit 1
+          fi
+
+          echo "Extracting to /opt/$ROOT_DIR"
+          sudo rm -rf "/opt/$ROOT_DIR"
           sudo tar -xJf /tmp/llvm-mingw.tar.xz -C /opt
+
+          if [ ! -d "/opt/$ROOT_DIR/bin" ]; then
+            echo "LLVM-MinGW bin directory missing: /opt/$ROOT_DIR/bin"
+            ls -la /opt || true
+            exit 1
+          fi
 
           echo "/opt/$ROOT_DIR/bin" >> "$GITHUB_PATH"
           echo "LLVM_MINGW=/opt/$ROOT_DIR" >> "$GITHUB_ENV"
