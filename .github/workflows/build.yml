@@ -3,14 +3,19 @@ name: Build RakNetDLL
 on:
   push:
     tags:
-      - 'v*'         # trigger on version tags like v1.0.0
-  workflow_dispatch: # also allow manual trigger from GitHub UI
+      - 'v*'
+
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v1.0.0)"
+        required: true
 
 env:
   DIST: dist
 
 jobs:
-  # ── Linux x64 ────────────────────────────────────────────────────────────
+
   build-linux-x64:
     runs-on: ubuntu-latest
     steps:
@@ -21,13 +26,13 @@ jobs:
           chmod +x build_dll.sh
           ./build_dll.sh linux64
 
-      - name: Upload Linux Shared Library
+      - name: Upload Linux artifact
         uses: actions/upload-artifact@v4
         with:
           name: linux-x64
           path: dist/linux-x64/libRakNetDLL.so
 
-  # ── Windows DLLs (LLVM-MinGW / Clang) ───────────────────────────────────
+
   build-windows:
     runs-on: ubuntu-latest
     steps:
@@ -36,86 +41,67 @@ jobs:
       - name: Install LLVM-MinGW
         run: |
           RELEASE=$(curl -fsSL https://api.github.com/repos/mstorsjo/llvm-mingw/releases/latest \
-                    | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])")
+            | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])")
+
           TARBALL="llvm-mingw-${RELEASE}-ucrt-ubuntu-22.04-x86_64.tar.xz"
           URL="https://github.com/mstorsjo/llvm-mingw/releases/download/${RELEASE}/${TARBALL}"
-          echo "Downloading ${URL}"
+
           curl -fsSL -o /tmp/llvm-mingw.tar.xz "$URL"
           sudo tar -xf /tmp/llvm-mingw.tar.xz -C /opt
           echo "/opt/llvm-mingw-${RELEASE}-ucrt-ubuntu-22.04-x86_64/bin" >> "$GITHUB_PATH"
 
-      - name: Build Windows DLLs
+      - name: Build DLLs
         run: |
           chmod +x build_dll.sh
           ./build_dll.sh win64
           ./build_dll.sh win32
           ./build_dll.sh win-arm64
 
-      - name: Upload Windows x64 DLL
+      - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: windows-x64
-          path: dist/win-x64/RakNetDLL.dll
+          name: windows-builds
+          path: |
+            dist/win-x64/RakNetDLL.dll
+            dist/win-x32/RakNetDLL.dll
+            dist/win-arm64/RakNetDLL.dll
 
-      - name: Upload Windows x86 DLL
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-x86
-          path: dist/win-x32/RakNetDLL.dll
 
-      - name: Upload Windows ARM64 DLL
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-arm64
-          path: dist/win-arm64/RakNetDLL.dll
-
-  # ── Create GitHub Release ─────────────────────────────────────────────────
   release:
     needs: [build-linux-x64, build-windows]
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # needed to create releases
+      contents: write
+
+    # فقط وقتی tag داریم اجرا شود
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download all artifacts
+      - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: Rename artifacts to avoid collisions
+      - name: Prepare files
         run: |
-          mv artifacts/linux-x64/libRakNetDLL.so   artifacts/libRakNetDLL-linux-x64.so
-          mv artifacts/windows-x64/RakNetDLL.dll   artifacts/raknet64.dll
-          mv artifacts/windows-x86/RakNetDLL.dll   artifacts/raknet.dll
-          mv artifacts/windows-arm64/RakNetDLL.dll artifacts/rakneta64.dll
+          mv artifacts/linux-x64/libRakNetDLL.so artifacts/raknet-linux-x64.so
+          mv artifacts/windows-builds/RakNetDLL.dll artifacts/raknet.dll
 
-      - name: Create release
+      - name: Set tag variable
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "TAG=${{ inputs.tag }}" >> $GITHUB_ENV
+          else
+            echo "TAG=${GITHUB_REF_NAME}" >> $GITHUB_ENV
+          fi
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: "RakNetDLL ${{ github.ref_name }}"
-          body: |
-            ## RakNetDLL — C-compatible wrapper release
-
-            Windows builds use [LLVM-MinGW](https://github.com/mstorsjo/llvm-mingw) (Clang/LLD, UCRT).
-
-            ### Files
-            | File | Platform |
-            |---|---|
-            | `libRakNetDLL-linux-x64.so` | Linux x64 |
-            | `raknet64.dll` | Windows x64 |
-            | `raknet.dll` | Windows x86 |
-            | `rakneta64.dll` | Windows arm64 |
-            | `raknet_c.h` | C header (all platforms) |
-
-            ### Usage
-            Include `raknet_c.h` in your C project and link against the appropriate DLL/SO.
-            See the [README](README.md) for compile instructions.
+          tag_name: ${{ env.TAG }}
+          name: "RakNetDLL ${{ env.TAG }}"
           files: |
-            artifacts/libRakNetDLL-linux-x64.so
-            artifacts/raknet64.dll
+            artifacts/raknet-linux-x64.so
             artifacts/raknet.dll
-            artifacts/rakneta64.dll
-            Source/raknet_c.h
-
