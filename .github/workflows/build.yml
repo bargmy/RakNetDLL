@@ -1,13 +1,13 @@
-name: Build RakNetDLL shared libraries
+name: Build RakNetDLL
 
-on:
+"on":
   push:
     tags:
       - 'v*'
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag to create/use, for example v1.0.0'
+        description: 'Release tag, for example v1.0.0'
         required: true
         type: string
 
@@ -21,97 +21,81 @@ env:
 
 jobs:
   build-so:
-    name: Build ${{ matrix.target }}
+    name: Build ${{ matrix.target }} .so
     runs-on: ubuntu-latest
-    continue-on-error: ${{ matrix.experimental }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: linux-x64
-            cxx: g++
-            install: ''
-            cxxflags: '-fPIC -fvisibility=default'
-            ldflags: '-pthread'
-            experimental: false
-
+            packages: ''
           - target: linux-x86
-            cxx: g++
-            install: 'g++-multilib libc6-dev-i386'
-            cxxflags: '-m32 -fPIC -fvisibility=default'
-            ldflags: '-m32 -pthread'
-            experimental: false
-
+            packages: 'g++-multilib libc6-dev-i386'
           - target: linux-arm64
-            cxx: aarch64-linux-gnu-g++
-            install: 'g++-aarch64-linux-gnu'
-            cxxflags: '-fPIC -fvisibility=default'
-            ldflags: '-pthread'
-            experimental: false
-
-          # Android is marked experimental because old RakNet code can expose
-          # platform-specific compile issues depending on the NDK version.
+            packages: 'g++-aarch64-linux-gnu'
           - target: android-arm64
-            cxx: android-ndk
-            install: ''
-            cxxflags: '-fPIC -fvisibility=default -DANDROID'
-            ldflags: ''
-            experimental: true
+            packages: ''
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Linux cross compiler dependencies
-        if: matrix.install != ''
+      - name: Install Linux dependencies
+        if: matrix.packages != ''
         run: |
+          set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y ${{ matrix.install }}
+          sudo apt-get install -y ${{ matrix.packages }}
 
       - name: Install Android NDK
         if: matrix.target == 'android-arm64'
         run: |
           set -euo pipefail
 
-          if [ -z "${ANDROID_HOME:-}" ]; then
-            echo "ANDROID_HOME is not set on this runner."
-            echo "ubuntu-latest normally includes the Android SDK; try ubuntu-22.04 if this fails."
-            exit 1
-          fi
-
+          ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
           SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+
           if [ ! -x "$SDKMANAGER" ]; then
             SDKMANAGER="$(command -v sdkmanager || true)"
           fi
+
           if [ -z "$SDKMANAGER" ] || [ ! -x "$SDKMANAGER" ]; then
-            echo "sdkmanager not found on this runner."
+            echo "sdkmanager not found. ANDROID_HOME=$ANDROID_HOME"
             exit 1
           fi
 
-          yes | "$SDKMANAGER" --licenses >/dev/null || true
-          yes | "$SDKMANAGER" --install "ndk;${NDK_VERSION}"
+          # Do NOT pipe yes into --install with pipefail enabled.
+          # yes exits with SIGPIPE after sdkmanager stops reading, which caused your Broken pipe failure.
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" --install "ndk;${NDK_VERSION}"
 
           NDK_PATH="$ANDROID_HOME/ndk/${NDK_VERSION}"
           CXX_PATH="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android${ANDROID_API}-clang++"
 
           if [ ! -x "$CXX_PATH" ]; then
             echo "Android compiler not found: $CXX_PATH"
+            find "$ANDROID_HOME/ndk" -maxdepth 4 -type f -name '*clang++' | sort || true
             exit 1
           fi
 
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=$NDK_PATH" >> "$GITHUB_ENV"
-          echo "REAL_CXX=$CXX_PATH" >> "$GITHUB_ENV"
+          echo "ANDROID_CXX=$CXX_PATH" >> "$GITHUB_ENV"
 
-      - name: Select compiler
-        if: matrix.target != 'android-arm64'
+      - name: Patch RakNet portability issue
         run: |
-          echo "REAL_CXX=${{ matrix.cxx }}" >> "$GITHUB_ENV"
+          set -euo pipefail
+
+          # RakNet's FileList.cpp includes x86-only low-level IO headers.
+          # They are not needed here and break Linux ARM64 / Android builds.
+          sed -i '/#include <asm\/io.h>/d; /#include <sys\/io.h>/d' Source/FileList.cpp
+
+          echo "Patched FileList.cpp include block:"
+          sed -n '12,28p' Source/FileList.cpp
 
       - name: Build shared library
         env:
           TARGET: ${{ matrix.target }}
-          CXXFLAGS_EXTRA: ${{ matrix.cxxflags }}
-          LDFLAGS_EXTRA: ${{ matrix.ldflags }}
         run: |
           set -euo pipefail
 
@@ -119,11 +103,6 @@ jobs:
           OUT_DIR="$GITHUB_WORKSPACE/${DIST}/${TARGET}"
           OBJ_DIR="$OUT_DIR/obj"
           mkdir -p "$OBJ_DIR"
-
-          if [ ! -d "$SRC_DIR" ]; then
-            echo "Missing Source directory. Are you running this at the repo root?"
-            exit 1
-          fi
 
           mapfile -t SOURCES < <(
             find "$SRC_DIR" -maxdepth 1 -name '*.cpp' \
@@ -137,17 +116,43 @@ jobs:
               | sort
           )
 
+          COMMON_OPTS=(-std=c++14 -O2 -w)
+          COMMON_DEFS=(-D_RAKNET_DLL -DRAKNET_C_EXPORTS)
+          CXXFLAGS=()
+          LDFLAGS=()
+
+          case "$TARGET" in
+            linux-x64)
+              REAL_CXX="g++"
+              CXXFLAGS=(-fPIC -fvisibility=default)
+              LDFLAGS=(-pthread)
+              ;;
+            linux-x86)
+              REAL_CXX="g++"
+              CXXFLAGS=(-m32 -fPIC -fvisibility=default)
+              LDFLAGS=(-m32 -pthread)
+              ;;
+            linux-arm64)
+              REAL_CXX="aarch64-linux-gnu-g++"
+              CXXFLAGS=(-fPIC -fvisibility=default)
+              LDFLAGS=(-pthread)
+              ;;
+            android-arm64)
+              REAL_CXX="$ANDROID_CXX"
+              COMMON_DEFS+=(-DANDROID "-D__ANDROID_API__=${ANDROID_API}")
+              CXXFLAGS=(-fPIC -fvisibility=default)
+              LDFLAGS=()
+              ;;
+            *)
+              echo "Unknown target: $TARGET"
+              exit 1
+              ;;
+          esac
+
           echo "Compiler: $REAL_CXX"
           "$REAL_CXX" --version || true
           echo "Target:   $TARGET"
           echo "Sources:  ${#SOURCES[@]}"
-
-          COMMON_DEFS="-D_RAKNET_DLL -DRAKNET_C_EXPORTS"
-          COMMON_OPTS="-std=c++14 -O2 -w"
-
-          if [ "$TARGET" = "android-arm64" ]; then
-            COMMON_DEFS="$COMMON_DEFS -DANDROID -D__ANDROID_API__=${ANDROID_API}"
-          fi
 
           JOBS="$(getconf _NPROCESSORS_ONLN || echo 2)"
           FAIL=0
@@ -156,7 +161,10 @@ jobs:
             BASE="$(basename "$SRC_FILE" .cpp)"
             OBJ_FILE="$OBJ_DIR/$BASE.o"
 
-            "$REAL_CXX" -c $COMMON_OPTS $COMMON_DEFS $CXXFLAGS_EXTRA \
+            "$REAL_CXX" -c \
+              "${COMMON_OPTS[@]}" \
+              "${COMMON_DEFS[@]}" \
+              "${CXXFLAGS[@]}" \
               -I"$SRC_DIR" \
               "$SRC_FILE" \
               -o "$OBJ_FILE" &
@@ -181,10 +189,11 @@ jobs:
 
           OUT_SO="$OUT_DIR/libRakNetDLL-${TARGET}.so"
 
-          "$REAL_CXX" -shared $CXXFLAGS_EXTRA \
+          "$REAL_CXX" -shared \
+            "${CXXFLAGS[@]}" \
             -o "$OUT_SO" \
             "$OBJ_DIR"/*.o \
-            $LDFLAGS_EXTRA
+            "${LDFLAGS[@]}"
 
           cp "$SRC_DIR/raknet_c.h" "$OUT_DIR/raknet_c.h"
           rm -rf "$OBJ_DIR"
@@ -202,9 +211,184 @@ jobs:
             ${{ env.DIST }}/${{ matrix.target }}/*.so
             ${{ env.DIST }}/${{ matrix.target }}/raknet_c.h
 
+  build-windows:
+    name: Build ${{ matrix.target }} DLL
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: windows-x64
+            cxx: x86_64-w64-mingw32-clang++
+          - target: windows-x86
+            cxx: i686-w64-mingw32-clang++
+          - target: windows-arm64
+            cxx: aarch64-w64-mingw32-clang++
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install LLVM-MinGW
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY' > /tmp/llvm-mingw-asset.txt
+          import json
+          import re
+          import sys
+          import urllib.request
+
+          url = 'https://api.github.com/repos/mstorsjo/llvm-mingw/releases/latest'
+          with urllib.request.urlopen(url) as r:
+              data = json.load(r)
+
+          assets = data.get('assets', [])
+          # Prefer UCRT Ubuntu x86_64 tarballs. The Ubuntu version in the filename changes over time,
+          # so do not hardcode ubuntu-22.04.
+          patterns = [
+              r'^llvm-mingw-.*-ucrt-ubuntu-.*-x86_64\.tar\.xz$',
+              r'^llvm-mingw-.*-ucrt-.*x86_64\.tar\.xz$',
+          ]
+
+          for pat in patterns:
+              rx = re.compile(pat)
+              for asset in assets:
+                  name = asset.get('name', '')
+                  if rx.match(name):
+                      print(asset['browser_download_url'])
+                      print(name)
+                      sys.exit(0)
+
+          print('No matching LLVM-MinGW asset found. Available assets:', file=sys.stderr)
+          for asset in assets:
+              print(' - ' + asset.get('name', ''), file=sys.stderr)
+          sys.exit(1)
+          PY
+
+          URL="$(sed -n '1p' /tmp/llvm-mingw-asset.txt)"
+          NAME="$(sed -n '2p' /tmp/llvm-mingw-asset.txt)"
+
+          echo "Downloading $NAME"
+          curl -fsSL -o /tmp/llvm-mingw.tar.xz "$URL"
+
+          ROOT_DIR="$(tar -tf /tmp/llvm-mingw.tar.xz | head -n 1 | cut -d/ -f1)"
+          sudo tar -xJf /tmp/llvm-mingw.tar.xz -C /opt
+
+          echo "/opt/$ROOT_DIR/bin" >> "$GITHUB_PATH"
+          echo "LLVM_MINGW=/opt/$ROOT_DIR" >> "$GITHUB_ENV"
+
+      - name: Patch RakNet portability issue
+        run: |
+          set -euo pipefail
+          sed -i '/#include <asm\/io.h>/d; /#include <sys\/io.h>/d' Source/FileList.cpp
+
+      - name: Build DLL
+        env:
+          TARGET: ${{ matrix.target }}
+          REAL_CXX: ${{ matrix.cxx }}
+        run: |
+          set -euo pipefail
+
+          SRC_DIR="$GITHUB_WORKSPACE/Source"
+          CASE_FIX="$GITHUB_WORKSPACE/mingw-case-fix"
+          OUT_DIR="$GITHUB_WORKSPACE/${DIST}/${TARGET}"
+          OBJ_DIR="$OUT_DIR/obj"
+          mkdir -p "$OBJ_DIR"
+
+          if ! command -v "$REAL_CXX" >/dev/null 2>&1; then
+            echo "Compiler not found: $REAL_CXX"
+            echo "PATH=$PATH"
+            ls -la "$LLVM_MINGW/bin" || true
+            exit 1
+          fi
+
+          mapfile -t SOURCES < <(
+            find "$SRC_DIR" -maxdepth 1 -name '*.cpp' \
+              ! -name '*_PS3*' \
+              ! -name '*_PS4*' \
+              ! -name '*_Vita*' \
+              ! -name '*_360*' \
+              ! -name '*_720*' \
+              ! -name '*WindowsStore*' \
+              ! -name '*NativeClient*' \
+              | sort
+          )
+
+          COMMON_OPTS=(-std=c++14 -O2 -w)
+          COMMON_DEFS=(-D_RAKNET_DLL -DRAKNET_C_EXPORTS -DWIN32 -D_WIN32)
+          CXXFLAGS=(-idirafter "$CASE_FIX")
+
+          echo "Compiler: $REAL_CXX"
+          "$REAL_CXX" --version || true
+          echo "Target:   $TARGET"
+          echo "Sources:  ${#SOURCES[@]}"
+
+          JOBS="$(getconf _NPROCESSORS_ONLN || echo 2)"
+          FAIL=0
+
+          for SRC_FILE in "${SOURCES[@]}"; do
+            BASE="$(basename "$SRC_FILE" .cpp)"
+            OBJ_FILE="$OBJ_DIR/$BASE.o"
+
+            "$REAL_CXX" -c \
+              "${COMMON_OPTS[@]}" \
+              "${COMMON_DEFS[@]}" \
+              "${CXXFLAGS[@]}" \
+              -I"$SRC_DIR" \
+              "$SRC_FILE" \
+              -o "$OBJ_FILE" &
+
+            while [ "$(jobs -pr | wc -l)" -ge "$JOBS" ]; do
+              if ! wait -n; then
+                FAIL=1
+              fi
+            done
+          done
+
+          while [ "$(jobs -pr | wc -l)" -gt 0 ]; do
+            if ! wait -n; then
+              FAIL=1
+            fi
+          done
+
+          if [ "$FAIL" -ne 0 ]; then
+            echo "One or more compile jobs failed."
+            exit 1
+          fi
+
+          OUT_DLL="$OUT_DIR/RakNetDLL-${TARGET}.dll"
+          OUT_IMPLIB="$OUT_DIR/RakNetDLL-${TARGET}.dll.a"
+
+          "$REAL_CXX" -shared \
+            "${CXXFLAGS[@]}" \
+            -o "$OUT_DLL" \
+            "$OBJ_DIR"/*.o \
+            -lws2_32 \
+            -Wl,--out-implib,"$OUT_IMPLIB"
+
+          cp "$SRC_DIR/raknet_c.h" "$OUT_DIR/raknet_c.h"
+          rm -rf "$OBJ_DIR"
+
+          echo "Built files:"
+          ls -lh "$OUT_DIR"
+          file "$OUT_DLL" || true
+
+      - name: Upload ${{ matrix.target }} artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          if-no-files-found: error
+          path: |
+            ${{ env.DIST }}/${{ matrix.target }}/*.dll
+            ${{ env.DIST }}/${{ matrix.target }}/*.dll.a
+            ${{ env.DIST }}/${{ matrix.target }}/raknet_c.h
+
   release:
     name: Create GitHub Release
-    needs: build-so
+    needs:
+      - build-so
+      - build-windows
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     permissions:
@@ -229,7 +413,7 @@ jobs:
           echo "Downloaded artifact tree:"
           find artifacts -type f -print | sort
 
-          find artifacts -type f -name '*.so' -exec cp -v '{}' release/ \;
+          find artifacts -type f \( -name '*.so' -o -name '*.dll' -o -name '*.dll.a' \) -exec cp -v '{}' release/ \;
 
           if [ -f Source/raknet_c.h ]; then
             cp -v Source/raknet_c.h release/raknet_c.h
@@ -240,8 +424,8 @@ jobs:
             fi
           fi
 
-          if ! find release -type f -name '*.so' | grep -q .; then
-            echo "No .so files were built, refusing to create an empty release."
+          if ! find release -type f \( -name '*.so' -o -name '*.dll' \) | grep -q .; then
+            echo "No binaries were built, refusing to create an empty release."
             exit 1
           fi
 
@@ -288,7 +472,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          NOTES="RakNetDLL shared library builds.\n\nFiles included when successfully built:\n- libRakNetDLL-linux-x64.so\n- libRakNetDLL-linux-x86.so\n- libRakNetDLL-linux-arm64.so\n- libRakNetDLL-android-arm64.so\n- raknet_c.h\n- SHA256SUMS.txt"
+          NOTES="RakNetDLL builds.\n\nExpected assets:\n- libRakNetDLL-linux-x64.so\n- libRakNetDLL-linux-x86.so\n- libRakNetDLL-linux-arm64.so\n- libRakNetDLL-android-arm64.so\n- RakNetDLL-windows-x64.dll\n- RakNetDLL-windows-x86.dll\n- RakNetDLL-windows-arm64.dll\n- import libraries .dll.a\n- raknet_c.h\n- SHA256SUMS.txt"
 
           if gh release view "${TAG}" >/dev/null 2>&1; then
             echo "Release ${TAG} already exists; uploading/replacing assets."
@@ -296,6 +480,5 @@ jobs:
           else
             gh release create "${TAG}" release/* \
               --title "RakNetDLL ${TAG}" \
-              --notes "$NOTES" \
-              --verify-tag
+              --notes "$NOTES"
           fi
